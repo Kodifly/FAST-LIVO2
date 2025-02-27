@@ -35,6 +35,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_w_wait_pub.reset(new PointCloudXYZI());
   pcl_wait_pub.reset(new PointCloudXYZI());
   pcl_wait_save.reset(new PointCloudXYZRGB());
+  pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
   vio_manager.reset(new VIOManager());
   root_dir = ROOT_DIR;
@@ -264,6 +265,7 @@ void LIVMapper::stateEstimationAndMapping()
       handleVIO();
       break;
     case LIO:
+    case LO:
       handleLIO();
       break;
   }
@@ -474,44 +476,50 @@ void LIVMapper::handleLIO()
 
 void LIVMapper::savePCD() 
 {
-  if (pcd_save_en && pcl_wait_save->points.size() > 0 && pcd_save_interval < 0) 
+  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
-    voxel_filter.setInputCloud(pcl_wait_save);
-    voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
-    voxel_filter.filter(*downsampled_cloud);
-
     std::string raw_points_dir = std::string(ROOT_DIR) + "Log/PCD/all_raw_points.pcd";
     std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/PCD/all_downsampled_points.pcd";
-
     pcl::PCDWriter pcd_writer;
 
-    // Save the raw point cloud data
-    pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save);
-    std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
-              << " with point count: " << pcl_wait_save->points.size() << RESET << std::endl;
-
-    // Save the downsampled point cloud data
-    pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud);
-    std::cout << GREEN << "Downsampled point cloud data saved to: " << downsampled_points_dir 
-          << " with point count after filtering: " << downsampled_cloud->points.size() << RESET << std::endl;
-
-    if(colmap_output_en)
+    if (img_en)
     {
-      fout_points << "# 3D point list with one line of data per point\n";
-      fout_points << "#  POINT_ID, X, Y, Z, R, G, B, ERROR\n";
-      for (size_t i = 0; i < downsampled_cloud->size(); ++i) 
+      pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+      pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
+      voxel_filter.setInputCloud(pcl_wait_save);
+      voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
+      voxel_filter.filter(*downsampled_cloud);
+  
+      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save); // Save the raw point cloud data
+      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
+                << " with point count: " << pcl_wait_save->points.size() << RESET << std::endl;
+      
+      pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud); // Save the downsampled point cloud data
+      std::cout << GREEN << "Downsampled point cloud data saved to: " << downsampled_points_dir 
+                << " with point count after filtering: " << downsampled_cloud->points.size() << RESET << std::endl;
+
+      if(colmap_output_en)
       {
-          const auto& point = downsampled_cloud->points[i];
-          fout_points << i << " "
-                      << std::fixed << std::setprecision(6)
-                      << point.x << " " << point.y << " " << point.z << " "
-                      << static_cast<int>(point.r) << " "
-                      << static_cast<int>(point.g) << " "
-                      << static_cast<int>(point.b) << " "
-                      << 0 << std::endl;
+        fout_points << "# 3D point list with one line of data per point\n";
+        fout_points << "#  POINT_ID, X, Y, Z, R, G, B, ERROR\n";
+        for (size_t i = 0; i < downsampled_cloud->size(); ++i) 
+        {
+            const auto& point = downsampled_cloud->points[i];
+            fout_points << i << " "
+                        << std::fixed << std::setprecision(6)
+                        << point.x << " " << point.y << " " << point.z << " "
+                        << static_cast<int>(point.r) << " "
+                        << static_cast<int>(point.g) << " "
+                        << static_cast<int>(point.b) << " "
+                        << 0 << std::endl;
+        }
       }
+    }
+    else
+    {      
+      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save_intensity);
+      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
+                << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
     }
   }
 }
@@ -526,7 +534,7 @@ void LIVMapper::run()
     {
       rate.sleep();
       continue;
-    }   
+    }
     handleFirstFrame();
 
     processImu();
@@ -1057,6 +1065,31 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     break;
   }
 
+  case ONLY_LO:
+  {
+    if (!lidar_pushed) 
+    { 
+      // If not in lidar scan, need to generate new meas
+      if (lid_raw_data_buffer.empty())  return false;
+      meas.lidar = lid_raw_data_buffer.front(); // push the first lidar topic
+      meas.lidar_frame_beg_time = lid_header_time_buffer.front(); // generate lidar_beg_time
+      meas.lidar_frame_end_time  = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000); // calc lidar scan end time
+      lidar_pushed = true;             
+    }
+    struct MeasureGroup m; // standard method to keep imu message.
+    m.lio_time = meas.lidar_frame_end_time;
+    mtx_buffer.lock();
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    lidar_pushed = false; // sync one whole lidar scan.
+    meas.lio_vio_flg = LO; // process lidar topic, so timestamp should be lidar scan end.
+    meas.measures.push_back(m);
+    return true;
+    break;
+  }
+
   default:
   {
     printf("!! WRONG SLAM TYPE !!");
@@ -1150,10 +1183,17 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
     static int scan_wait_num = 0;
 
-    *pcl_wait_save += *laserCloudWorldRGB;
+    if (img_en)
+    {
+      *pcl_wait_save += *laserCloudWorldRGB;
+    }
+    else
+    {
+      *pcl_wait_save_intensity += *pcl_w_wait_pub;
+    }
     scan_wait_num++;
 
-    if (pcl_wait_save->size() > 0 && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
+    if ((pcl_wait_save->size() > 0 || pcl_wait_save_intensity->size() > 0) && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
     {
       pcd_index++;
       string all_points_dir(string(string(ROOT_DIR) + "Log/PCD/") + to_string(pcd_index) + string(".pcd"));
@@ -1161,8 +1201,16 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       if (pcd_save_en)
       {
         cout << "current scan saved to /PCD/" << all_points_dir << endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save); // pcl::io::savePCDFileASCII(all_points_dir, *pcl_wait_save);
-        PointCloudXYZRGB().swap(*pcl_wait_save);
+        if (img_en)
+        {
+          pcd_writer.writeBinary(all_points_dir, *pcl_wait_save); // pcl::io::savePCDFileASCII(all_points_dir, *pcl_wait_save);
+          PointCloudXYZRGB().swap(*pcl_wait_save);
+        }
+        else
+        {
+          pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_intensity);
+          PointCloudXYZI().swap(*pcl_wait_save_intensity);
+        }        
         Eigen::Quaterniond q(_state.rot_end);
         fout_pcd_pos << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " " << q.w() << " " << q.x() << " " << q.y()
                      << " " << q.z() << " " << endl;
@@ -1170,11 +1218,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       }
     }
   }
-  if(laserCloudWorldRGB->size() > 0) 
-  {
-    PointCloudXYZI().swap(*pcl_wait_pub); 
-    PointCloudXYZRGB().swap(*laserCloudWorldRGB);
-  }
+  if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
   PointCloudXYZI().swap(*pcl_w_wait_pub);
 }
 
